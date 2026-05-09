@@ -185,20 +185,36 @@ class KuramotoLayer(nn.Module):
 # =============================================================================
 
 class CellReadout(nn.Module):
-    """Maps final oscillator phases of each cell to 9 digit logits."""
-    def __init__(self, osc_per_cell: int, hidden_dim: int = 32, n_digits: int = 9):
+    """Maps final oscillator phases of each cell to 9 digit logits.
+
+    Features per channel:
+        use_amplitude=False : (cos(theta), sin(theta))           — 2 features
+        use_amplitude=True  : (cos(theta), sin(theta), |zeta|)   — 3 features
+
+    The amplitude-aware version is for SMM variants that compute zeta as a
+    complex tensor; the magnitude carries information that would otherwise
+    be discarded by `zeta.angle()`.
+    """
+    def __init__(self, osc_per_cell: int, hidden_dim: int = 32,
+                 n_digits: int = 9, use_amplitude: bool = False):
         super().__init__()
-        # Use (sin, cos) of each phase as features — invariant to 2pi shifts
+        self.use_amplitude = use_amplitude
+        n_features = osc_per_cell * (3 if use_amplitude else 2)
         self.head = nn.Sequential(
-            nn.Linear(osc_per_cell * 2, hidden_dim),
+            nn.Linear(n_features, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, n_digits),
         )
 
-    def forward(self, theta: torch.Tensor) -> torch.Tensor:
+    def forward(self, theta: torch.Tensor,
+                amplitude: torch.Tensor = None) -> torch.Tensor:
         # theta: (B, n_cells, osc_per_cell)  ->  logits: (B, n_cells, n_digits)
-        feat = torch.cat([theta.cos(), theta.sin()], dim=-1)
-        return self.head(feat)
+        feats = [theta.cos(), theta.sin()]
+        if self.use_amplitude:
+            assert amplitude is not None, \
+                "amplitude required when use_amplitude=True"
+            feats.append(amplitude)
+        return self.head(torch.cat(feats, dim=-1))
 
 
 # =============================================================================
@@ -257,6 +273,9 @@ class AKOrNWithSMM(nn.Module):
     The input projection produces a 3*osc_per_cell vector per cell, which is
     then split into (r, theta, z) chunks by HelicalEmbedding. The phase of the
     resulting complex zeta is used directly as the Kuramoto initial condition.
+
+    NOTE: this variant discards |zeta| (amplitude) when calling .angle().
+    See AKOrNWithSMMAmp for the version that preserves amplitude info.
     """
     def __init__(self, embed_dim: int = 24, intermediate_dim: int = 12,
                  osc_per_cell: int = 4, kuramoto_steps: int = 8):
@@ -280,6 +299,49 @@ class AKOrNWithSMM(nn.Module):
         phases = zeta.angle()                        # extract phase from complex repr
         phases = self.kuramoto(phases)
         logits = self.readout(phases)                # (B, 81, 9)
+        return logits
+
+
+class AKOrNWithSMMAmp(nn.Module):
+    """SMM variant that preserves amplitude information (Path A diagnostic).
+
+    Identical to AKOrNWithSMM except the readout receives BOTH phase
+    (via cos/sin) AND amplitude (|zeta|) per channel. This tests the
+    hypothesis that the lossy `zeta.angle()` extraction in AKOrNWithSMM
+    was a major source of underperformance.
+
+    Architectural choice: amplitude is taken from the *initial* zeta
+    (before Kuramoto). Kuramoto only modifies phases; the amplitude
+    carries direct information from the input embedding through to
+    the readout, bypassing the oscillator dynamics. This is a deliberate
+    decision to test whether the encoder's amplitude signal is what the
+    baseline's flexible Linear projection was implicitly capturing.
+
+    Param overhead vs AKOrNWithSMM:
+        readout input grows from 2*osc_per_cell to 3*osc_per_cell features
+        => +osc_per_cell * hidden_dim params (e.g., 4 * 32 = 128 at defaults)
+    """
+    def __init__(self, embed_dim: int = 24, intermediate_dim: int = 12,
+                 osc_per_cell: int = 4, kuramoto_steps: int = 8):
+        super().__init__()
+        self.osc_per_cell = osc_per_cell
+        assert intermediate_dim == 3 * osc_per_cell
+        self.embed = GridEmbedding(embed_dim)
+        self.proj_intermediate = nn.Linear(embed_dim, intermediate_dim)
+        self.helical = HelicalEmbedding(input_dim=intermediate_dim)
+        self.kuramoto = KuramotoLayer(n_cells=81, osc_per_cell=osc_per_cell,
+                                       n_steps=kuramoto_steps)
+        # Amplitude-aware readout: 3 features per channel (cos, sin, |zeta|)
+        self.readout = CellReadout(osc_per_cell, use_amplitude=True)
+
+    def forward(self, puzzle: torch.Tensor) -> torch.Tensor:
+        e = self.embed(puzzle)
+        h = F.gelu(self.proj_intermediate(e))
+        zeta, _ = self.helical(h)                    # complex
+        phases = zeta.angle()
+        amplitudes = zeta.abs()                      # *** preserved ***
+        phases = self.kuramoto(phases)               # Kuramoto only touches phases
+        logits = self.readout(phases, amplitudes)
         return logits
 
 

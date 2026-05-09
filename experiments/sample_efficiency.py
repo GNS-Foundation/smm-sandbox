@@ -46,6 +46,7 @@ from torch.utils.data import DataLoader, Subset
 from akorn_smm_sudoku import (
     AKOrNBaseline,
     AKOrNWithSMM,
+    AKOrNWithSMMAmp,
     SudokuDataset,
     loss_and_metrics,
     count_params,
@@ -123,6 +124,8 @@ def make_model(name: str, *, embed_dim: int, osc_per_cell: int,
         return AKOrNBaseline(**kwargs)
     if name == 'smm':
         return AKOrNWithSMM(**kwargs)
+    if name == 'smm_amp':
+        return AKOrNWithSMMAmp(**kwargs)
     raise ValueError(f"Unknown model name: {name!r}")
 
 
@@ -132,7 +135,7 @@ def make_model(name: str, *, embed_dim: int, osc_per_cell: int,
 
 def run_sweep(args) -> List[RunResult]:
     train_sizes = sorted(int(x) for x in args.train_sizes.split(','))
-    model_names = ('baseline', 'smm')
+    model_names = tuple(name.strip() for name in args.models.split(','))
     largest_train_size = max(train_sizes)
     total_runs = len(model_names) * len(train_sizes) * args.seeds
 
@@ -261,24 +264,27 @@ def plot_curves(summary: Dict[Tuple[str, int], Dict[str, float]],
         print("       install with: pip install matplotlib")
         return
 
-    fig, ax = plt.subplots(figsize=(7.5, 5))
+    fig, ax = plt.subplots(figsize=(8, 5.5))
     style = {
         'baseline': dict(color='#1f77b4', marker='o', label='AKOrN-baseline'),
-        'smm':      dict(color='#d62728', marker='s', label='AKOrN+SMM'),
+        'smm':      dict(color='#d62728', marker='s', label='AKOrN+SMM (phase only)'),
+        'smm_amp':  dict(color='#2ca02c', marker='^', label='AKOrN+SMM (phase + amplitude)'),
     }
 
-    for name, st in style.items():
+    present_models = sorted({n for n, _ in summary})
+    for name in present_models:
+        st = style.get(name, dict(color='gray', marker='x', label=name))
         sizes = sorted({s for n, s in summary if n == name})
         means = np.array([summary[(name, s)]['mean'] for s in sizes])
         stds  = np.array([summary[(name, s)]['std']  for s in sizes])
         ax.plot(sizes, means, lw=2, **st)
         ax.fill_between(sizes, means - stds, means + stds,
-                        color=st['color'], alpha=0.18)
+                        color=st['color'], alpha=0.15)
 
     ax.set_xscale('log')
     ax.set_xlabel('Training set size (puzzles, log scale)')
     ax.set_ylabel(metric_label)
-    ax.set_title('Sample-efficiency: AKOrN-baseline vs AKOrN+SMM\n(mean ± 1 std across seeds)')
+    ax.set_title('Sample-efficiency comparison\n(mean ± 1 std across seeds)')
     ax.legend(loc='lower right')
     ax.grid(True, which='both', alpha=0.3)
     fig.tight_layout()
@@ -291,64 +297,76 @@ def plot_curves(summary: Dict[Tuple[str, int], Dict[str, float]],
 
 def print_summary_table(summary: Dict[Tuple[str, int], Dict[str, float]]) -> None:
     sizes = sorted({s for _, s in summary})
+    models = sorted({n for n, _ in summary})
+    col_w = 18
     print()
     print(f"=== Sample-efficiency summary (val_acc on blanks) ===")
-    print(f"{'train_size':<12} {'baseline':>18} {'smm':>18} {'delta':>10}")
-    print(f"{'-'*60}")
+    header = f"{'train_size':<12}" + ''.join(f"{m:>{col_w}}" for m in models)
+    print(header)
+    print('-' * len(header))
     for size in sizes:
-        b = summary.get(('baseline', size))
-        s = summary.get(('smm', size))
-        if not (b and s):
-            continue
-        b_str = f"{b['mean']:.3f} ± {b['std']:.3f}"
-        s_str = f"{s['mean']:.3f} ± {s['std']:.3f}"
-        delta = s['mean'] - b['mean']
-        sign = '+' if delta >= 0 else ''
-        print(f"{size:<12} {b_str:>18} {s_str:>18} {sign}{delta:.3f}")
+        row = f"{size:<12}"
+        for m in models:
+            cell = summary.get((m, size))
+            row += (f"{cell['mean']:.3f} ± {cell['std']:.3f}".rjust(col_w)
+                    if cell else 'N/A'.rjust(col_w))
+        print(row)
     print()
 
 
 def report_n50(summary: Dict[Tuple[str, int], Dict[str, float]]) -> None:
     sizes = sorted({s for _, s in summary})
+    models = sorted({n for n, _ in summary})
     max_size = max(sizes)
+
+    if 'baseline' not in models:
+        print("[note] baseline not in sweep; skipping N_50 ratio analysis")
+        return
+
     base_max = summary[('baseline', max_size)]['mean']
-    smm_max  = summary[('smm', max_size)]['mean']
-    target = 0.5 * max(base_max, smm_max)
-
-    n50_b = compute_n50(summary, 'baseline', target)
-    n50_s = compute_n50(summary, 'smm', target)
-
     print(f"=== N_50 analysis ===")
-    print(f"  max accuracy at largest train size:")
-    print(f"    baseline = {base_max:.3f}")
-    print(f"    smm      = {smm_max:.3f}")
-    print(f"  target (50% of max) : {target:.3f}")
-    print(f"  N_50(baseline)      : {n50_b}")
-    print(f"  N_50(smm)           : {n50_s}")
-
-    if n50_b is None or n50_s is None:
-        print(f"  [N_50 ratio not computable -- target not reached at any size by one model]")
-        print(f"  Try increasing --epochs or expanding --train-sizes upward.")
-    else:
-        ratio = n50_b / n50_s
-        verdict = ("SMM more sample-efficient" if ratio > 1
-                   else "tied" if ratio == 1
-                   else "baseline more sample-efficient")
-        print(f"  ratio (baseline / smm): {ratio:.2f}    [{verdict}]")
-        print()
-        if ratio >= 2.0:
-            print(f"  *** Falsifiable claim status: SUPPORTED at this scale  ***")
-            print(f"      (SMM reaches target with at least 2x fewer puzzles)")
-        elif ratio > 1.0:
-            print(f"  *** Falsifiable claim status: WEAK SIGNAL                ***")
-            print(f"      (SMM ahead but below 2x threshold; need more seeds/scale)")
-        elif ratio == 1.0:
-            print(f"  *** Falsifiable claim status: TIED at this scale          ***")
-            print(f"      (Both reach target at the same train size; expand grid)")
-        else:
-            print(f"  *** Falsifiable claim status: NOT SUPPORTED at this scale ***")
-            print(f"      (Baseline is more sample-efficient in this configuration)")
+    print(f"  baseline max accuracy at N={max_size}: {base_max:.3f}")
     print()
+
+    for name in models:
+        if name == 'baseline':
+            continue
+        cand_max = summary[(name, max_size)]['mean']
+        target = 0.5 * max(base_max, cand_max)
+
+        n50_b = compute_n50(summary, 'baseline', target)
+        n50_c = compute_n50(summary, name, target)
+
+        print(f"  --- {name} vs baseline ---")
+        print(f"    {name} max accuracy at N={max_size}: {cand_max:.3f}")
+        print(f"    target (50% of max)               : {target:.3f}")
+        print(f"    N_50(baseline)                    : {n50_b}")
+        print(f"    N_50({name}){' '*(max(0, 23-len(name)))}: {n50_c}")
+
+        if n50_b is None or n50_c is None:
+            print(f"    [N_50 not computable — target unreached at any size]")
+            print(f"    Try increasing --epochs or extending --train-sizes upward.")
+        else:
+            ratio = n50_b / n50_c
+            verdict = ("more sample-efficient" if ratio > 1
+                       else "tied" if ratio == 1
+                       else "less sample-efficient")
+            print(f"    ratio (baseline / {name}): {ratio:.2f}    [{name} {verdict}]")
+            if ratio >= 2.0:
+                tag = "SUPPORTED at this scale"
+                detail = f"({name} reaches target with at least 2x fewer puzzles)"
+            elif ratio > 1.0:
+                tag = "WEAK SIGNAL"
+                detail = f"({name} ahead but below 2x threshold)"
+            elif ratio == 1.0:
+                tag = "TIED at this scale"
+                detail = "(both reach target at the same train size)"
+            else:
+                tag = "NOT SUPPORTED at this scale"
+                detail = f"(baseline more sample-efficient than {name})"
+            print(f"    Falsifiable claim status: {tag}")
+            print(f"      {detail}")
+        print()
 
 
 # =============================================================================
@@ -359,6 +377,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     p.add_argument('--train-sizes', type=str, default='32,64,128,256,512',
                    help='Comma-separated training set sizes (log-spaced recommended)')
+    p.add_argument('--models', type=str, default='baseline,smm,smm_amp',
+                   help='Comma-separated model names to compare')
     p.add_argument('--seeds', type=int, default=3)
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--val-size', type=int, default=64)
