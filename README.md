@@ -44,7 +44,7 @@ smm-sandbox/
 
 ```bash
 # Clone and install (editable)
-git clone https://github.com/<you>/smm-sandbox.git
+git clone https://github.com/GNS-Foundation/smm-sandbox.git
 cd smm-sandbox
 pip install -e .
 
@@ -101,7 +101,7 @@ If this sandbox contributes to published work, please cite:
 @software{smm_sandbox_2026,
   title  = {smm-sandbox: Spiral Manifold Mapping for oscillatory neural networks},
   year   = {2026},
-  url    = {https://github.com/<you>/smm-sandbox}
+  url    = {https://github.com/GNS-Foundation/smm-sandbox}
 }
 ```
 
