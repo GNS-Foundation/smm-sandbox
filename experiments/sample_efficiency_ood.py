@@ -59,6 +59,9 @@ from akorn_smm_sudoku import (
     AKOrNBaseline,
     AKOrNWithSMM,
     AKOrNWithSMMAmp,
+    AKOrNWithSMMFull,
+    AKOrNHelicalCoupled,
+    AKOrNWithSMMHelicalCoupled,
     loss_and_metrics,
     count_params,
 )
@@ -266,6 +269,12 @@ def make_model(name: str, *, embed_dim: int, osc_per_cell: int,
         return AKOrNWithSMM(**kwargs)
     if name == 'smm_amp':
         return AKOrNWithSMMAmp(**kwargs)
+    if name == 'smm_full':
+        return AKOrNWithSMMFull(**kwargs)
+    if name == 'helical_coupled':
+        return AKOrNHelicalCoupled(**kwargs)
+    if name == 'smm_helical_coupled':
+        return AKOrNWithSMMHelicalCoupled(**kwargs)
     raise ValueError(f"Unknown model: {name!r}")
 
 
@@ -439,8 +448,9 @@ def plot_three_panels(results: List[RunResult], out_path: Path) -> None:
 
     style = {
         'baseline': dict(color='#1f77b4', marker='o', label='AKOrN-baseline'),
-        'smm':      dict(color='#d62728', marker='s', label='AKOrN+SMM'),
-        'smm_amp':  dict(color='#2ca02c', marker='^', label='AKOrN+SMM (+amp)'),
+        'smm':      dict(color='#d62728', marker='s', label='AKOrN+SMM (encoder)'),
+        'smm_amp':  dict(color='#2ca02c', marker='^', label='AKOrN+SMM (encoder+amp)'),
+        'smm_full': dict(color='#9467bd', marker='D', label='AKOrN+SMM (full body)'),
     }
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharey=True)
@@ -630,7 +640,10 @@ def overall_verdict(results: List[RunResult]) -> None:
 def main():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     p.add_argument('--train-sizes', type=str, default='32,64,128,256,512')
-    p.add_argument('--models', type=str, default='baseline,smm,smm_amp')
+    p.add_argument('--models', type=str, default='baseline,smm,smm_full',
+                   help='Comma-separated model names. Default drops smm_amp '
+                        '(consistently worst in prior runs); add it back '
+                        'with --models baseline,smm,smm_amp,smm_full')
     p.add_argument('--seeds', type=int, default=3)
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--val-size', type=int, default=64)
