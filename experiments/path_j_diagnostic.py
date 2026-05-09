@@ -1,46 +1,38 @@
 """
 experiments/path_j_diagnostic.py
 =================================
-What did the helical metric actually learn?
+What did the helical/toroidal metric actually learn?
 
 Path J showed `helical_coupled` (baseline encoder + HelicalCoupledKuramoto)
-beats baseline by +14/+7/+1pp at N=64/256/1024 on in-distribution. Two
-interpretations are consistent with that data:
+beats baseline by +14/+7/+1pp at N=64/256/1024 on in-distribution. The
+diagnostic on the helical version returned PARTIAL A: peer/non-peer K-mass
+ratio of 1.50, with a clear hierarchy:
+    same_row_only:  0.453   (1.52x non-peer)
+    same_col_only:  0.450   (1.51x non-peer)
+    same_box_only:  0.354   (1.19x non-peer)  <-- bottlenecked
+    non_peer:       0.298
 
-  (A) The metric learned the Sudoku structural prior (cells in same row,
-      column, or 3x3 box should couple strongly). This would show up as:
-         - K[i,j] much larger when i,j are peers (share a row/col/box)
-         - Cell helical positions clustering by row/col/box
+The single-helix metric handles 1D row/col fine but only partially captures
+the 2D box pattern. Toroidal extension (T^2 = S^1 x S^1) gives the metric
+two independent angular axes; the prediction is that box coupling will
+rise toward row/col level, lifting the overall ratio.
 
-  (B) The metric just over-fit the in-distribution puzzle distribution
-      (efficient training-set fitting, not structural understanding). This
-      would show up as:
-         - K[i,j] roughly uniform across peer/non-peer pairs
-         - Cell positions unstructured by row/col/box
-         - Or: positions clustered by some pattern that helps in-dist
-           but not OOD-difficulty (consistent with the gap-ratio of 3.4
-           we saw at N=64)
+This script trains ONE model (--model helical_coupled or --model
+toroidal_coupled) and runs the same three tests, so you can directly
+compare the outputs across topologies.
 
-This script trains ONE model at the standard scale-up config, then runs
-quantitative tests that distinguish (A) from (B):
-
-  Test 1 (peer vs non-peer K mass): mean of K over peer pairs vs over
-          non-peer pairs. Ratio > 2.0 = strong structural learning;
-          ratio ~ 1.0 = no structural learning.
-
-  Test 2 (position clustering): PCA of cell helical position features
-          to 2D, then a simple cluster-score: mean intra-row pairwise
-          distance vs inter-row pairwise distance. Same for col, box.
-          Score < 0.7 = strong clustering; score ~ 1.0 = no clustering.
-
-  Test 3 (visualizations):
-          - 81x81 K-matrix heatmap with row/col/box separators
-          - 2D PCA of cell positions colored three ways (row, col, box)
-          - K-mass distribution histograms (peer vs non-peer)
+Tests:
+  Test 1 (peer-mass): mean K[i,j] across pair categories
+                      (same_row, same_col, same_box, non-peer).
+  Test 2 (clustering): PCA of cell position features to 2D, then
+                       intra/inter-group distance ratio per axis.
+  Test 3 (heatmap):    81x81 K matrix visualization.
 
 Usage:
     python experiments/path_j_diagnostic.py
-    python experiments/path_j_diagnostic.py --train-size 256 --seed 0
+    python experiments/path_j_diagnostic.py --model toroidal_coupled
+    python experiments/path_j_diagnostic.py --model toroidal_coupled_wide \\
+        --train-size 256 --epochs 30
 """
 
 from __future__ import annotations
@@ -57,11 +49,38 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
 from akorn_smm_sudoku import (
-    AKOrNHelicalCoupled, loss_and_metrics, count_params,
+    AKOrNHelicalCoupled, AKOrNToroidalCoupled,
+    loss_and_metrics, count_params,
 )
 from sample_efficiency_ood import (
     SudokuDatasetOOD, random_solved_sudoku,
 )
+
+
+def make_diag_model(model_name: str, *, embed_dim: int, osc_per_cell: int,
+                     kuramoto_steps: int) -> nn.Module:
+    """Build the model variant under test. Returns a model whose `kuramoto`
+    layer exposes both `coupling()` and `position_features()`."""
+    intermediate_dim = 3 * osc_per_cell
+    if model_name == 'helical_coupled':
+        return AKOrNHelicalCoupled(
+            embed_dim=embed_dim, intermediate_dim=intermediate_dim,
+            osc_per_cell=osc_per_cell, kuramoto_steps=kuramoto_steps,
+        )
+    if model_name == 'toroidal_coupled':
+        # Matched-param: n_helical_channels=12 vs helical's 16
+        return AKOrNToroidalCoupled(
+            embed_dim=embed_dim, intermediate_dim=intermediate_dim,
+            osc_per_cell=osc_per_cell, kuramoto_steps=kuramoto_steps,
+            n_helical_channels=12,
+        )
+    if model_name == 'toroidal_coupled_wide':
+        return AKOrNToroidalCoupled(
+            embed_dim=embed_dim, intermediate_dim=intermediate_dim,
+            osc_per_cell=osc_per_cell, kuramoto_steps=kuramoto_steps,
+            n_helical_channels=16,
+        )
+    raise ValueError(f"Unknown diagnostic model: {model_name!r}")
 
 
 # Sudoku structure helpers -----------------------------------------------------
@@ -98,13 +117,13 @@ def peer_masks() -> dict:
 
 # Training a single model ------------------------------------------------------
 
-def train_diagnostic_model(args) -> AKOrNHelicalCoupled:
-    print(f"Training one AKOrNHelicalCoupled at standard scale-up config...")
+def train_diagnostic_model(args) -> nn.Module:
+    print(f"Training one {args.model} at standard scale-up config...")
     print(f"  N={args.train_size}, epochs={args.epochs}, lr={args.lr}, "
           f"seed={args.seed}")
 
     # Build dataset (same convention as sample_efficiency_ood.py)
-    base_rng = np.random.default_rng(42)
+    base_rng = np.random.default_rng(args.base_pool_seed)
     bases = [random_solved_sudoku(base_rng) for _ in range(40)]
     train_set = SudokuDatasetOOD(args.train_size, bases,
                                   n_blanks=args.n_blanks, seed=args.seed)
@@ -112,9 +131,9 @@ def train_diagnostic_model(args) -> AKOrNHelicalCoupled:
 
     # Build model
     torch.manual_seed(args.seed)
-    model = AKOrNHelicalCoupled(
+    model = make_diag_model(
+        args.model,
         embed_dim=args.embed_dim,
-        intermediate_dim=3 * args.osc_per_cell,
         osc_per_cell=args.osc_per_cell,
         kuramoto_steps=args.kuramoto_steps,
     )
@@ -207,16 +226,16 @@ def test_peer_mass(K: np.ndarray, out_dir: Path) -> dict:
 
 # Test 2: position clustering --------------------------------------------------
 
-def cell_features(model: AKOrNHelicalCoupled) -> np.ndarray:
-    """Stack per-cell helical position features into (81, 4*H) array.
+def cell_features(model: nn.Module) -> np.ndarray:
+    """Stack per-cell position features into (81, F) array.
 
-    Use cos(phi), sin(phi) instead of phi (avoid wraparound discontinuity)
-    so PCA / Euclidean distance behave correctly.
+    Uses the model.kuramoto.position_features() method, which is
+    implemented by both HelicalCoupledKuramoto and ToroidalCoupledKuramoto
+    so this function works with either topology. The feature dimension
+    differs (4*H for helix, 6*H for torus) but the per-cell layout is
+    consistent and PCA-compatible.
     """
-    r = model.kuramoto.cell_r.detach().cpu().numpy()       # (81, H)
-    phi = model.kuramoto.cell_phi.detach().cpu().numpy()   # (81, H)
-    z = model.kuramoto.cell_z.detach().cpu().numpy()       # (81, H)
-    return np.concatenate([r, np.cos(phi), np.sin(phi), z], axis=-1)
+    return model.kuramoto.position_features().cpu().numpy()
 
 
 def pca_2d(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -321,9 +340,16 @@ def test_coupling_heatmap(K: np.ndarray, out_dir: Path) -> None:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[1])
+    p.add_argument('--model', type=str, default='helical_coupled',
+                   choices=['helical_coupled', 'toroidal_coupled',
+                            'toroidal_coupled_wide'],
+                   help='Which coupled-Kuramoto variant to diagnose')
     p.add_argument('--train-size', type=int, default=256,
                    help='Path J showed clearest signal at N=256')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--base-pool-seed', type=int, default=42,
+                   help='RNG seed for the base puzzle pool. Match to your '
+                        'main sweep for consistent comparison.')
     p.add_argument('--epochs', type=int, default=30)
     p.add_argument('--lr', type=float, default=1e-2)
     p.add_argument('--batch-size', type=int, default=16)
@@ -331,9 +357,12 @@ def main():
     p.add_argument('--embed-dim', type=int, default=64)
     p.add_argument('--osc-per-cell', type=int, default=16)
     p.add_argument('--kuramoto-steps', type=int, default=16)
-    p.add_argument('--out-dir', type=str, default='experiments/results_path_j_diag')
+    p.add_argument('--out-dir', type=str, default=None,
+                   help='Default: experiments/results_path_j_diag_<model>')
     args = p.parse_args()
 
+    if args.out_dir is None:
+        args.out_dir = f'experiments/results_path_j_diag_{args.model}'
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

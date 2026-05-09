@@ -62,6 +62,7 @@ from akorn_smm_sudoku import (
     AKOrNWithSMMFull,
     AKOrNHelicalCoupled,
     AKOrNWithSMMHelicalCoupled,
+    AKOrNToroidalCoupled,
     loss_and_metrics,
     count_params,
 )
@@ -275,6 +276,16 @@ def make_model(name: str, *, embed_dim: int, osc_per_cell: int,
         return AKOrNHelicalCoupled(**kwargs)
     if name == 'smm_helical_coupled':
         return AKOrNWithSMMHelicalCoupled(**kwargs)
+    if name == 'toroidal_coupled':
+        # Matched-param variant: n_helical_channels=12 keeps total params
+        # within ~0.2% of helical_coupled at n_helical_channels=16.
+        # The torus has 4 position params per (cell, channel) vs the helix's 3,
+        # so 4*81*12 = 3888 ~ 3*81*16 = 3888 (exactly matched).
+        return AKOrNToroidalCoupled(**kwargs, n_helical_channels=12)
+    if name == 'toroidal_coupled_wide':
+        # Wide variant: same n_helical_channels (16) as helical_coupled.
+        # Tests topology + capacity together; ~33% more params than helical.
+        return AKOrNToroidalCoupled(**kwargs, n_helical_channels=16)
     raise ValueError(f"Unknown model: {name!r}")
 
 

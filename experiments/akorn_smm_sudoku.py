@@ -373,6 +373,189 @@ class HelicalCoupledKuramoto(nn.Module):
         energy = -(K * cos_diff).sum(dim=(-1, -2))
         return energy
 
+    def position_features(self) -> torch.Tensor:
+        """Per-cell position features for diagnostic / clustering analysis.
+
+        Single-helix layout: features = [r, cos(phi), sin(phi), z]
+        Returns: (n_cells, 4 * n_helical_channels) tensor.
+
+        Using cos/sin instead of phi avoids the wraparound discontinuity
+        that would break Euclidean PCA on the angle.
+        """
+        return torch.cat([
+            self.cell_r,
+            self.cell_phi.cos(),
+            self.cell_phi.sin(),
+            self.cell_z,
+        ], dim=-1).detach()
+
+
+# =============================================================================
+# Path J extension: Kuramoto with toroidal-distance-modulated coupling
+# =============================================================================
+
+class ToroidalCoupledKuramoto(nn.Module):
+    """Kuramoto layer where cell-to-cell coupling is derived from learnable
+    per-cell positions on a torus T^2 = S^1 x S^1, instead of a single helix.
+
+    Why a torus
+    -----------
+    Path J's diagnostic showed that the single-helix metric learns row and
+    column couplings cleanly (~0.45) but only partially captures box
+    coupling (~0.35), because a 3x3 box is a 2D pattern that a single
+    1D helical winding axis cannot represent in one coordinate. A torus
+    has two independent angular axes (alpha, beta), naturally fitting a
+    2D grid: the model can learn alpha to track row, beta to track column,
+    and box coupling emerges as the conjunction of both small-deviation
+    conditions.
+
+    Each cell holds learnable position parameters per helical channel:
+        (r_i^c, alpha_i^c, beta_i^c, z_i^c)
+
+    The toroidal-deviation metric:
+        ds^2 = sum_c [
+            dr^2
+            + r_avg^2 ( (d_alpha - omega_alpha*dz)^2 + (d_beta - omega_beta*dz)^2 )
+            + dz^2
+        ]
+
+    Both angle differences and both deviations are wrapped to [-pi, pi].
+
+    Coupling weights are still K_ij = exp(-ds^2_ij / sigma^2), zeroed on
+    the diagonal. Only `replace` mode (no learnable residual K) is supported
+    here -- mix mode can be added later if it becomes necessary.
+
+    Param accounting at n_cells=81, n_helical_channels=H:
+        cell_r, cell_alpha, cell_beta, cell_z : 4 * 81 * H
+        omega_alpha, omega_beta               : 2 * H
+        omega_kuramoto                        : 81
+        log_sigma                             : 1
+
+    For matched-param comparison against single-helix (which has 3 cell
+    position params per channel), use n_helical_channels = floor(3H_helical/4).
+    For example, H_helical=16 -> H_toroidal=12 gives roughly equal params.
+    """
+    def __init__(self, n_cells: int = 81, osc_per_cell: int = 4,
+                 n_steps: int = 8, eta: float = 0.1,
+                 n_helical_channels: int = None,
+                 sigma_init: float = 1.0):
+        super().__init__()
+        if n_helical_channels is None:
+            n_helical_channels = osc_per_cell
+        self.n_cells = n_cells
+        self.osc_per_cell = osc_per_cell
+        self.n_steps = n_steps
+        self.eta = eta
+        self.n_helical_channels = n_helical_channels
+
+        # Learnable toroidal position per cell (per helical channel)
+        self.cell_r = nn.Parameter(torch.randn(n_cells, n_helical_channels) * 0.3)
+        self.cell_alpha = nn.Parameter(torch.randn(n_cells, n_helical_channels) * 0.3)
+        self.cell_beta = nn.Parameter(torch.randn(n_cells, n_helical_channels) * 0.3)
+        self.cell_z = nn.Parameter(torch.randn(n_cells, n_helical_channels) * 0.3)
+
+        # Two independent winding frequencies, one per angular axis. Same
+        # geometric init as HelicalEmbedding for symmetry-breaking.
+        self.omega_alpha = nn.Parameter(
+            torch.exp(torch.linspace(-2.0, 2.0, n_helical_channels))
+        )
+        self.omega_beta = nn.Parameter(
+            torch.exp(torch.linspace(-2.0, 2.0, n_helical_channels))
+        )
+
+        # Per-cell natural frequency for Kuramoto dynamics
+        self.omega_kuramoto = nn.Parameter(torch.zeros(n_cells, 1))
+
+        # Kernel bandwidth (parametrize log so sigma stays positive)
+        self.log_sigma = nn.Parameter(torch.tensor(math.log(sigma_init)))
+
+    def _toroidal_distance_squared(self) -> torch.Tensor:
+        """Pairwise ds^2 between all cells under the toroidal metric.
+
+        Returns:
+            ds_sq: (n_cells, n_cells) — sum over channels.
+        """
+        r = self.cell_r            # (N, C)
+        alpha = self.cell_alpha
+        beta = self.cell_beta
+        z = self.cell_z
+
+        # Pairwise differences (N, N, C)
+        dr = r.unsqueeze(1) - r.unsqueeze(0)
+        dz = z.unsqueeze(1) - z.unsqueeze(0)
+        dalpha = alpha.unsqueeze(1) - alpha.unsqueeze(0)
+        dbeta = beta.unsqueeze(1) - beta.unsqueeze(0)
+
+        # Wrap angle differences to [-pi, pi]
+        dalpha = (dalpha + math.pi) % (2 * math.pi) - math.pi
+        dbeta = (dbeta + math.pi) % (2 * math.pi) - math.pi
+
+        # Deviations from natural winding rates, also wrapped
+        dev_alpha = dalpha - self.omega_alpha * dz
+        dev_beta = dbeta - self.omega_beta * dz
+        dev_alpha = (dev_alpha + math.pi) % (2 * math.pi) - math.pi
+        dev_beta = (dev_beta + math.pi) % (2 * math.pi) - math.pi
+
+        # Average radius (matches Module 2's discretization choice)
+        r_avg = 0.5 * (r.unsqueeze(1) + r.unsqueeze(0))
+
+        # Toroidal metric: ds^2 = dr^2 + r^2 (dev_alpha^2 + dev_beta^2) + dz^2
+        ds_sq_per_channel = (
+            dr.pow(2)
+            + r_avg.pow(2) * (dev_alpha.pow(2) + dev_beta.pow(2))
+            + dz.pow(2)
+        )
+        return ds_sq_per_channel.sum(dim=-1)
+
+    def coupling(self) -> torch.Tensor:
+        """Return the (n_cells, n_cells) coupling matrix used in dynamics."""
+        ds_sq = self._toroidal_distance_squared()
+        sigma_sq = (2.0 * self.log_sigma).exp() + 1e-8
+        K = (-ds_sq / sigma_sq).exp()
+        eye = torch.eye(self.n_cells, device=K.device, dtype=K.dtype)
+        return K * (1.0 - eye)
+
+    def forward(self, theta: torch.Tensor,
+                n_steps: int = None,
+                return_trajectory: bool = False):
+        # theta: (B, n_cells, osc_per_cell)
+        n = self.n_steps if n_steps is None else n_steps
+        K = self.coupling()
+        if return_trajectory:
+            trajectory = [theta]
+        for _ in range(n):
+            diff = theta.unsqueeze(2) - theta.unsqueeze(1)
+            coupling = torch.einsum('ij,bijc->bic', K, diff.sin())
+            theta = theta + self.eta * (self.omega_kuramoto + coupling)
+            if return_trajectory:
+                trajectory.append(theta)
+        if return_trajectory:
+            return theta, torch.stack(trajectory, dim=1)
+        return theta
+
+    def compute_energy(self, theta: torch.Tensor) -> torch.Tensor:
+        K = self.coupling()
+        diff = theta.unsqueeze(2) - theta.unsqueeze(1)
+        cos_diff = diff.cos().sum(dim=-1)
+        energy = -(K * cos_diff).sum(dim=(-1, -2))
+        return energy
+
+    def position_features(self) -> torch.Tensor:
+        """Per-cell position features for diagnostic / clustering analysis.
+
+        Toroidal layout: features = [r, cos(alpha), sin(alpha),
+                                     cos(beta),  sin(beta),  z]
+        Returns: (n_cells, 6 * n_helical_channels) tensor.
+        """
+        return torch.cat([
+            self.cell_r,
+            self.cell_alpha.cos(),
+            self.cell_alpha.sin(),
+            self.cell_beta.cos(),
+            self.cell_beta.sin(),
+            self.cell_z,
+        ], dim=-1).detach()
+
 
 # =============================================================================
 # Shared readout: phases -> per-cell digit logits
@@ -775,6 +958,46 @@ class AKOrNWithSMMHelicalCoupled(nn.Module):
         h = F.gelu(self.proj_intermediate(e))
         zeta, _ = self.helical(h)
         phases = zeta.angle()
+        return kuramoto_evaluate(self.kuramoto, self.readout, phases,
+                                  n_steps=n_steps_eval,
+                                  average_window=average_window)
+
+
+class AKOrNToroidalCoupled(nn.Module):
+    """Path J extension: baseline-style encoder + ToroidalCoupledKuramoto.
+
+    Identical to AKOrNHelicalCoupled except the cell positions live on a
+    torus T^2 = S^1 x S^1 instead of a single helix. Tests whether the
+    box-coupling bottleneck observed in the Path J diagnostic was a
+    consequence of the single-helix's 1D winding axis being unable to
+    represent the 2D box pattern.
+
+    Default n_helical_channels=12 keeps total parameters within ~0.2% of
+    AKOrNHelicalCoupled at n_helical_channels=16, isolating the topology
+    variable rather than confounding it with capacity. Use the wide variant
+    (n_helical_channels=16) to test capacity + topology together.
+    """
+    def __init__(self, embed_dim: int = 24, intermediate_dim: int = 12,
+                 osc_per_cell: int = 4, kuramoto_steps: int = 8,
+                 n_helical_channels: int = None):
+        super().__init__()
+        self.osc_per_cell = osc_per_cell
+        self.embed = GridEmbedding(embed_dim)
+        self.proj_intermediate = nn.Linear(embed_dim, intermediate_dim)
+        self.proj_phases = nn.Linear(intermediate_dim, osc_per_cell)
+        self.kuramoto = ToroidalCoupledKuramoto(
+            n_cells=81, osc_per_cell=osc_per_cell,
+            n_steps=kuramoto_steps,
+            n_helical_channels=n_helical_channels,
+        )
+        self.readout = CellReadout(osc_per_cell)
+
+    def forward(self, puzzle: torch.Tensor,
+                n_steps_eval: int = None,
+                average_window: int = 0) -> torch.Tensor:
+        e = self.embed(puzzle)
+        h = F.gelu(self.proj_intermediate(e))
+        phases = self.proj_phases(h)
         return kuramoto_evaluate(self.kuramoto, self.readout, phases,
                                   n_steps=n_steps_eval,
                                   average_window=average_window)
