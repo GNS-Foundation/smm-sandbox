@@ -374,11 +374,49 @@ def aggregate(results: List[RunResult], surface: str
 
 def compute_n50(summary: Dict[Tuple[str, int], Dict[str, float]],
                 model_name: str, target_acc: float) -> Optional[int]:
+    """Smallest grid-point train_size where mean accuracy reaches target_acc.
+
+    Discrete: returns one of the sizes in the sweep, or None.
+    Use compute_n50_interp for sub-grid resolution.
+    """
     sizes = sorted({s for n, s in summary if n == model_name})
     for size in sizes:
         if summary[(model_name, size)]['mean'] >= target_acc:
             return size
     return None
+
+
+def compute_n50_interp(summary: Dict[Tuple[str, int], Dict[str, float]],
+                       model_name: str, target_acc: float) -> Optional[float]:
+    """Interpolated N_50 — linear interpolation in log-N space.
+
+    Finds the train_size at which the linearly-interpolated mean accuracy
+    equals target_acc. More sensitive than the grid-point version when
+    crossings happen between adjacent grid points (which is most of the
+    time at this grid resolution).
+
+    Returns float (not int) since the result is a continuous estimate.
+    None if target was never reached.
+    """
+    sizes = sorted({s for n, s in summary if n == model_name})
+    accs = [summary[(model_name, s)]['mean'] for s in sizes]
+
+    # If first point already at/above target
+    if accs[0] >= target_acc:
+        return float(sizes[0])
+
+    # Find first crossing between consecutive grid points
+    for i in range(len(sizes) - 1):
+        if accs[i] < target_acc <= accs[i + 1]:
+            log_lo = np.log(sizes[i])
+            log_hi = np.log(sizes[i + 1])
+            denom = accs[i + 1] - accs[i]
+            if denom <= 0:  # non-monotone segment; fall back to upper grid point
+                return float(sizes[i + 1])
+            frac = (target_acc - accs[i]) / denom
+            return float(np.exp(log_lo + frac * (log_hi - log_lo)))
+
+    return None  # never reached
 
 
 def save_csv(results: List[RunResult], path: Path) -> None:
@@ -455,6 +493,7 @@ def print_summary(results: List[RunResult]) -> None:
 
 
 def report_n50_per_surface(results: List[RunResult]) -> None:
+    """Per-surface N_50 ratios using both grid-point and interpolated estimates."""
     models = sorted({r.model_name for r in results})
     sizes = sorted({r.train_size for r in results})
     if 'baseline' not in models:
@@ -467,41 +506,121 @@ def report_n50_per_surface(results: List[RunResult]) -> None:
         print()
         print(f"=== N_50 analysis on {SURFACE_LABELS[surface]} ===")
         print(f"  baseline max accuracy at N={max_size}: {base_max:.3f}")
+        print(f"  {'model':<10} {'max':>8} {'N50_grid':>10} "
+              f"{'N50_interp':>12} {'ratio_int':>10}  verdict")
         for name in models:
             if name == 'baseline':
                 continue
             cand_max = summary[(name, max_size)]['mean']
             target = 0.5 * max(base_max, cand_max)
-            n50_b = compute_n50(summary, 'baseline', target)
-            n50_c = compute_n50(summary, name, target)
-            if n50_b is None or n50_c is None:
-                verdict = "N_50 not reached"
+
+            n50_b_grid = compute_n50(summary, 'baseline', target)
+            n50_c_grid = compute_n50(summary, name, target)
+            n50_b_int = compute_n50_interp(summary, 'baseline', target)
+            n50_c_int = compute_n50_interp(summary, name, target)
+
+            if n50_b_int is None or n50_c_int is None:
+                ratio_str = "  N/A"
+                verdict = "target not reached"
             else:
-                ratio = n50_b / n50_c
-                if ratio >= 2.0:
-                    verdict = f"ratio={ratio:.2f}  *** SUPPORTED ***"
-                elif ratio > 1.0:
-                    verdict = f"ratio={ratio:.2f}  WEAK SIGNAL"
-                elif ratio == 1.0:
-                    verdict = f"ratio={ratio:.2f}  TIED"
+                ratio_int = n50_b_int / n50_c_int
+                if ratio_int >= 2.0:
+                    verdict = "*** SUPPORTED ***"
+                elif ratio_int >= 1.10:
+                    verdict = "WEAK SIGNAL (smm ahead)"
+                elif ratio_int >= 0.90:
+                    verdict = "TIED (within 10%)"
                 else:
-                    verdict = f"ratio={ratio:.2f}  NOT SUPPORTED"
-            print(f"  {name:8s} (max={cand_max:.3f}): {verdict}")
+                    verdict = "NOT SUPPORTED (baseline ahead)"
+                ratio_str = f"{ratio_int:8.2f}"
+
+            n50_b_str = str(n50_b_grid) if n50_b_grid else "—"
+            n50_c_str = str(n50_c_grid) if n50_c_grid else "—"
+            n50_b_int_str = f"{n50_b_int:.0f}" if n50_b_int else "—"
+            n50_c_int_str = f"{n50_c_int:.0f}" if n50_c_int else "—"
+            print(f"  {name:<10} {cand_max:>8.3f} "
+                  f"{n50_b_str:>4}/{n50_c_str:<5} "
+                  f"{n50_b_int_str:>5}/{n50_c_int_str:<6} "
+                  f"{ratio_str}  {verdict}")
+
+
+def report_generalization_gap(results: List[RunResult]) -> None:
+    """Generalization gap (in_dist − ood_diff) per (model, train_size).
+
+    Smaller gap = the model degrades less when puzzles get harder.
+    A model with structural priors should have smaller gap if the prior
+    captures task structure rather than just fitting easy examples.
+    """
+    in_dist = aggregate(results, 'acc_in_dist')
+    ood_diff = aggregate(results, 'acc_ood_diff')
+    sizes = sorted({r.train_size for r in results})
+    models = sorted({r.model_name for r in results})
+
+    print()
+    print(f"=== Generalization gap (in_dist − ood_diff)  — smaller is better ===")
+    print(f"   A smaller gap means the model degrades LESS on harder puzzles.")
+    print(f"   This is the signature of an inductive bias that captures task structure.")
+    print()
+    col_w = 14
+    header = f"{'train_size':<12}" + ''.join(f"{m:>{col_w}}" for m in models)
+    print(header)
+    print('-' * len(header))
+    for size in sizes:
+        row = f"{size:<12}"
+        for m in models:
+            id_ = in_dist.get((m, size))
+            od = ood_diff.get((m, size))
+            if id_ and od:
+                gap = id_['mean'] - od['mean']
+                row += f"{gap:>{col_w}.3f}"
+            else:
+                row += 'N/A'.rjust(col_w)
+        print(row)
+
+    # Compare each candidate's gap vs baseline's gap
+    if 'baseline' in models:
+        print()
+        print(f"   Gap-ratio (candidate / baseline) — < 1.0 means SMM transfers BETTER:")
+        for m in models:
+            if m == 'baseline':
+                continue
+            ratios = []
+            for size in sizes:
+                bgap = (in_dist[('baseline', size)]['mean']
+                        - ood_diff[('baseline', size)]['mean'])
+                cgap = (in_dist[(m, size)]['mean']
+                        - ood_diff[(m, size)]['mean'])
+                if bgap > 0:
+                    ratios.append((size, cgap / bgap))
+            ratio_strs = ', '.join(f"N={s}: {r:.2f}" for s, r in ratios)
+            print(f"     {m:<10}  {ratio_strs}")
 
 
 def overall_verdict(results: List[RunResult]) -> None:
     """Summary across all three eval surfaces — the headline interpretation."""
     print()
-    print(f"=== Overall verdict ===")
-    print(f"The hypothesis we care about: structural priors (SMM) should help most")
-    print(f"on OOD surfaces (especially OOD-difficulty), even if they tie or lose")
-    print(f"on in-distribution evaluation.")
+    print(f"=== How to read this ===")
+    print(f"Three signals worth checking, in order of how much they support SMM:")
     print()
-    print(f"Read the three N_50 tables above. The interesting outcomes are:")
-    print(f"  - SMM loses on in_dist but WINS on ood_diff -> compositional advantage")
-    print(f"  - SMM wins everywhere                       -> general advantage")
-    print(f"  - SMM loses everywhere                      -> bias is wrong here")
-    print(f"  - SMM ties everywhere                       -> indistinguishable; need scale")
+    print(f"  1. INTERPOLATED N_50 ratios — does SMM reach a target with fewer")
+    print(f"     samples than baseline? Look at ratio_int per surface:")
+    print(f"        > 2.0   ->  SUPPORTED ")
+    print(f"        > 1.10  ->  WEAK SIGNAL")
+    print(f"        ≈ 1.0   ->  TIED (within 10%)")
+    print(f"        < 0.90  ->  NOT SUPPORTED")
+    print()
+    print(f"  2. GENERALIZATION GAP (in_dist − ood_diff) — does SMM degrade LESS")
+    print(f"     than baseline when puzzles get harder?")
+    print(f"     Gap-ratio < 1.0 means SMM transfers better, even if its")
+    print(f"     absolute accuracy is lower.")
+    print()
+    print(f"  3. CROSS-SURFACE PATTERN — does SMM's gap to baseline shrink")
+    print(f"     as we move from in_dist → ood_base → ood_diff?")
+    print(f"     If yes, the structural prior is doing real work even if it's")
+    print(f"     not winning in absolute terms yet.")
+    print()
+    print(f"At fixed (small) capacity, signals 2 and 3 are what tell you")
+    print(f"the inductive bias matters. Signal 1 typically only flips at scale.")
 
 
 # =============================================================================
@@ -559,6 +678,7 @@ def main():
 
     print_summary(results)
     report_n50_per_surface(results)
+    report_generalization_gap(results)
     overall_verdict(results)
     plot_three_panels(results, out_dir / 'sample_efficiency_ood.png')
 
