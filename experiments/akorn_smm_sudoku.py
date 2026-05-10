@@ -558,6 +558,133 @@ class ToroidalCoupledKuramoto(nn.Module):
 
 
 # =============================================================================
+# Hand-crafted control: Sudoku peer-adjacency Kuramoto coupling
+# =============================================================================
+
+def build_sudoku_peer_matrix(n_grid_side: int = 9) -> torch.Tensor:
+    """Construct the binary peer-adjacency matrix for an n_grid_side x
+    n_grid_side Sudoku grid.
+
+    K[i, j] = 1.0 if cells i and j are 'peers' under standard Sudoku rules:
+    same row, same column, or same box. Diagonal is 0.
+
+    For 9x9 Sudoku, each cell has 20 peers (8 row + 8 col + 4 box-only,
+    after removing overlaps). Total edges in the peer graph: 81 * 20 = 1620.
+
+    Returns: (n_cells, n_cells) float tensor of {0, 1} entries.
+    """
+    n_cells = n_grid_side * n_grid_side
+    box_size = int(round(math.sqrt(n_grid_side)))
+    assert box_size * box_size == n_grid_side, \
+        f"n_grid_side must be a perfect square; got {n_grid_side}"
+
+    rows = torch.arange(n_cells) // n_grid_side
+    cols = torch.arange(n_cells) % n_grid_side
+    boxes = (rows // box_size) * box_size + (cols // box_size)
+
+    same_row = rows[:, None] == rows[None, :]
+    same_col = cols[:, None] == cols[None, :]
+    same_box = boxes[:, None] == boxes[None, :]
+    eye = torch.eye(n_cells, dtype=torch.bool)
+
+    peer = (same_row | same_col | same_box) & ~eye
+    return peer.float()
+
+
+class FixedPeerKuramoto(nn.Module):
+    """Kuramoto layer with a hand-crafted, fixed binary peer-adjacency
+    coupling matrix. The control experiment for Path J's structural-prior
+    findings.
+
+    Hypothesis under test:
+        Does SMM (helical or toroidal) discover something a knowledgeable
+        human couldn't have specified, or does it merely *recover* the
+        Sudoku peer-adjacency structure?
+
+    If this hand-crafted layer reaches similar accuracy / OOD-difficulty
+    as helical_coupled or toroidal_coupled_wide, then SMM's contribution
+    is automated feature engineering rather than novel geometric discovery.
+    If SMM beats this baseline, it has found a soft prior that strict
+    binary peer-adjacency misses.
+
+    Two modes:
+      'binary'  -- K[i,j] = scale * peer[i,j]                 (1 learnable param)
+      'soft'    -- K[i,j] = scale_peer * peer[i,j]
+                          + scale_nonpeer * (1 - peer[i,j] - I)  (2 learnable params)
+
+    Plus the standard `omega_kuramoto` (per-cell natural frequency, 81 params)
+    that all Kuramoto variants share.
+
+    Total learnable params in the layer: 82 (binary) or 83 (soft).
+    Compare to KuramotoLayer's 6,642 (free 81x81 K + omega).
+    """
+    def __init__(self, n_cells: int = 81, osc_per_cell: int = 4,
+                 n_steps: int = 8, eta: float = 0.1,
+                 mode: str = 'binary',
+                 scale_init: float = 0.05):
+        super().__init__()
+        self.n_cells = n_cells
+        self.osc_per_cell = osc_per_cell
+        self.n_steps = n_steps
+        self.eta = eta
+        self.mode = mode
+
+        # Fixed peer-adjacency matrix (buffer, not learnable)
+        n_grid_side = int(round(math.sqrt(n_cells)))
+        peer = build_sudoku_peer_matrix(n_grid_side=n_grid_side)
+        self.register_buffer('peer_matrix', peer)
+        eye = torch.eye(n_cells)
+        self.register_buffer('non_peer_matrix', 1.0 - peer - eye)
+
+        # Learnable scalar scaling. log-parametrized to keep positive.
+        if mode == 'binary':
+            self.log_scale = nn.Parameter(torch.tensor(math.log(scale_init)))
+        elif mode == 'soft':
+            # Init: peer scale matches HelicalCoupled's typical converged value (~0.05);
+            # non-peer scale starts smaller so the hierarchy is approximately
+            # consistent with the helical_coupled diagnostic at training start.
+            self.log_scale_peer = nn.Parameter(torch.tensor(math.log(scale_init)))
+            self.log_scale_nonpeer = nn.Parameter(torch.tensor(math.log(scale_init * 0.5)))
+        else:
+            raise ValueError(f"mode must be 'binary' or 'soft'; got {mode!r}")
+
+        # Per-cell natural frequency for Kuramoto dynamics (matches KuramotoLayer)
+        self.omega_kuramoto = nn.Parameter(torch.zeros(n_cells, 1))
+
+    def coupling(self) -> torch.Tensor:
+        if self.mode == 'binary':
+            return self.log_scale.exp() * self.peer_matrix
+        # soft mode: separate scales for peer and non-peer pairs
+        K = (self.log_scale_peer.exp() * self.peer_matrix
+             + self.log_scale_nonpeer.exp() * self.non_peer_matrix)
+        return K  # diagonal already zero by construction
+
+    def forward(self, theta: torch.Tensor,
+                n_steps: int = None,
+                return_trajectory: bool = False):
+        n = self.n_steps if n_steps is None else n_steps
+        K = self.coupling()
+        if return_trajectory:
+            trajectory = [theta]
+        for _ in range(n):
+            diff = theta.unsqueeze(2) - theta.unsqueeze(1)
+            coupling = torch.einsum('ij,bijc->bic', K, diff.sin())
+            theta = theta + self.eta * (self.omega_kuramoto + coupling)
+            if return_trajectory:
+                trajectory.append(theta)
+        if return_trajectory:
+            return theta, torch.stack(trajectory, dim=1)
+        return theta
+
+    def compute_energy(self, theta: torch.Tensor) -> torch.Tensor:
+        K = self.coupling()
+        diff = theta.unsqueeze(2) - theta.unsqueeze(1)
+        cos_diff = diff.cos().sum(dim=-1)
+        energy = -(K * cos_diff).sum(dim=(-1, -2))
+        return energy
+
+
+# =============================================================================
 # Shared readout: phases -> per-cell digit logits
 # =============================================================================
 
@@ -989,6 +1116,49 @@ class AKOrNToroidalCoupled(nn.Module):
             n_cells=81, osc_per_cell=osc_per_cell,
             n_steps=kuramoto_steps,
             n_helical_channels=n_helical_channels,
+        )
+        self.readout = CellReadout(osc_per_cell)
+
+    def forward(self, puzzle: torch.Tensor,
+                n_steps_eval: int = None,
+                average_window: int = 0) -> torch.Tensor:
+        e = self.embed(puzzle)
+        h = F.gelu(self.proj_intermediate(e))
+        phases = self.proj_phases(h)
+        return kuramoto_evaluate(self.kuramoto, self.readout, phases,
+                                  n_steps=n_steps_eval,
+                                  average_window=average_window)
+
+
+class AKOrNFixedPeerCoupled(nn.Module):
+    """Hand-crafted control: baseline-style encoder + FixedPeerKuramoto.
+
+    The decisive control experiment for Path J's claims. If this hand-crafted
+    layer reaches similar performance as helical_coupled / toroidal_coupled_wide,
+    then SMM is providing automated structure recovery, not novel discovery.
+    If SMM beats it, SMM has found a soft prior beyond binary peer-adjacency.
+
+    Two variants via `mode`:
+        'binary' -- K[i,j] = scale * peer[i,j]      (1 learnable param + 81 omega)
+        'soft'   -- K[i,j] = a*peer + b*nonpeer    (2 learnable params + 81 omega)
+
+    Either variant has dramatically fewer learnable parameters in the coupling
+    than baseline (6,642), helical_coupled (~3,990), or toroidal_coupled (~3,994):
+    only 82 or 83 params in the layer. This makes the hand-crafted result
+    a *minimal*, very-strongly-biased prior — exactly what the control should be.
+    """
+    def __init__(self, embed_dim: int = 24, intermediate_dim: int = 12,
+                 osc_per_cell: int = 4, kuramoto_steps: int = 8,
+                 mode: str = 'binary', scale_init: float = 0.05):
+        super().__init__()
+        self.osc_per_cell = osc_per_cell
+        self.embed = GridEmbedding(embed_dim)
+        self.proj_intermediate = nn.Linear(embed_dim, intermediate_dim)
+        self.proj_phases = nn.Linear(intermediate_dim, osc_per_cell)
+        self.kuramoto = FixedPeerKuramoto(
+            n_cells=81, osc_per_cell=osc_per_cell,
+            n_steps=kuramoto_steps,
+            mode=mode, scale_init=scale_init,
         )
         self.readout = CellReadout(osc_per_cell)
 

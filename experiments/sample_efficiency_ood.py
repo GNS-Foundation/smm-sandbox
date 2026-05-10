@@ -63,6 +63,7 @@ from akorn_smm_sudoku import (
     AKOrNHelicalCoupled,
     AKOrNWithSMMHelicalCoupled,
     AKOrNToroidalCoupled,
+    AKOrNFixedPeerCoupled,
     loss_and_metrics,
     count_params,
 )
@@ -286,6 +287,14 @@ def make_model(name: str, *, embed_dim: int, osc_per_cell: int,
         # Wide variant: same n_helical_channels (16) as helical_coupled.
         # Tests topology + capacity together; ~33% more params than helical.
         return AKOrNToroidalCoupled(**kwargs, n_helical_channels=16)
+    if name == 'fixed_peer_binary':
+        # Hand-crafted control. K[i,j] = scale*peer[i,j].
+        # Only 1 learnable scale + 81 omega in the coupling layer.
+        return AKOrNFixedPeerCoupled(**kwargs, mode='binary')
+    if name == 'fixed_peer_soft':
+        # Soft hand-crafted: separate scales for peers vs non-peers.
+        # 2 learnable scales + 81 omega in the coupling layer.
+        return AKOrNFixedPeerCoupled(**kwargs, mode='soft')
     raise ValueError(f"Unknown model: {name!r}")
 
 
