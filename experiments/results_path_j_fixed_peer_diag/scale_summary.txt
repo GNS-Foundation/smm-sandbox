@@ -1,0 +1,21 @@
+=== fixed_peer_binary diagnostic ===
+
+Learnable scalar (log_scale -> scale via exp):
+  log_scale  = -1.7680
+  scale      = 0.1707
+
+K[i,j] statistics:
+  K[peer]_mean   = 0.1707  (= scale, by construction)
+  K[non-peer]    = 0.0000  (= 0, by construction)
+  peer/non-peer ratio: infinity (binary)
+
+Comparison to helical_coupled's learned K (Path J diagnostic):
+  helical K[peer]      ~ 0.42-0.45
+  helical K[non-peer]  ~ 0.30
+  helical ratio        ~ 1.50x
+
+Interpretation:
+  fixed_peer_binary uses a perfectly binary peer/non-peer prior.
+  Single learnable scalar converged to 0.1707.
+  Sum of coupling per cell = 20 * 0.1707 = 3.4134
+  (vs. helical ~80 * 0.34 = 27 with much softer hierarchy)
