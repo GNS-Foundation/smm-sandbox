@@ -68,7 +68,7 @@ datasets/
 *.hdf5
 
 # Secrets
-.env
+.env*
 .env.local
 *.key
 experiments/results_ood/
